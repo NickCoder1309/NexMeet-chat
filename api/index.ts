@@ -1,7 +1,6 @@
 import { Server, type Socket } from "socket.io";
 import "dotenv/config";
 import { request } from "./request";
-import jwt from "jsonwebtoken";
 
 const origins = (process.env.ORIGINS ?? "")
   .split(",")
@@ -15,7 +14,7 @@ const origins = (process.env.ORIGINS ?? "")
 const io = new Server({
   cors: {
     origin: origins,
-    methods: ["GET", "POST"],
+    methods: ["GET", "POST", "PUT"],
     credentials: true,
     allowedHeaders: ["Content-Type", "Authorization"],
   },
@@ -23,12 +22,29 @@ const io = new Server({
 
 const port = Number(process.env.PORT);
 
+/**
+ * @typedef {Object} ChatMessagePayload
+ * @property {string} userId - ID of the user sending the message.
+ * @property {string} message - Message content.
+ * @property {string} [timestamp] - Optional timestamp of the message.
+ */
 type ChatMessagePayload = {
   userId: string;
   message: string;
   timestamp?: string;
 };
 
+/**
+ * @typedef {Object} UserWithSocketId
+ * @property {string} userId - Unique user ID.
+ * @property {string} socketId - Socket ID associated with the user.
+ * @property {string|null} [name] - User's name.
+ * @property {string|null} [email] - User's email.
+ * @property {number|null} [age] - User's age.
+ * @property {string|null} [photoURL] - URL to the user's profile picture.
+ * @property {string|null} [createdAt] - Timestamp of user creation.
+ * @property {string|null} [updatedAt] - Timestamp of last update.
+ */
 type UserWithSocketId = {
   userId: string;
   socketId: string;
@@ -40,114 +56,96 @@ type UserWithSocketId = {
   updatedAt?: string | null;
 };
 
+/**
+ * @typedef {Object} BackendError
+ * @property {string} error - Error message returned by backend.
+ */
 type BackendError = { error: string };
 
-io.use((socket, next) => {
-  const token = socket.handshake.auth.token;
-
-  console.log("Authenticating socket:", socket.id);
-
-  if (!token) {
-    console.error("No token provided");
-    return next(new Error("Authentication token required"));
-  }
-
-  try {
-    const JWT_SECRET = process.env.JWT_SECRET;
-
-    if (!JWT_SECRET) {
-      console.error("❌ JWT_SECRET not configured");
-      return next(new Error("Server configuration error"));
-    }
-
-    const decoded = jwt.verify(token, JWT_SECRET) as {
-      userId: string;
-      email?: string;
-    };
-
-    socket.data.userId = decoded.userId;
-    socket.data.email = decoded.email;
-    socket.data.token = token;
-
-    console.log("Token valid for user:", decoded.userId);
-    next();
-  } catch (error) {
-    console.error("❌ Invalid token:", error);
-    return next(new Error("Invalid or expired token"));
-  }
-});
-
+/**
+ * Handles incoming socket connections.
+ */
 io.on("connection", (socket: Socket) => {
-  console.log("✅ Authenticated connection:", socket.id);
-  console.log("   User ID:", socket.data.userId);
+  console.log("New connection:", socket.id);
 
   /**
    * Registers a new user joining a meeting.
    *
    * @event newUser
+   * @param {string} token - Authentication token.
+   * @param {string} userId - ID of the joining user.
    * @param {string} meetId - ID of the meeting room.
    */
-  socket.on("newUser", async (meetId: string) => {
-    const userId = socket.data.userId;
-    const token = socket.data.token;
+  socket.on(
+    "newUser",
+    async (token: string, userId: string, meetId: string) => {
+      console.log(
+        `Attempting to register new user: ${userId} in meeting: ${meetId}`,
+      );
 
-    console.log(`Attempting to register user: ${userId} in meeting: ${meetId}`);
+      try {
+        if (!meetId || !userId || !token) {
+          socket.emit("chatServerError", {
+            origin: "newUser",
+            message: "Missing parameters",
+          });
+          return;
+        }
 
-    try {
-      if (!meetId) {
-        socket.emit("socketServerError", {
-          origin: "newUser",
-          message: "Meeting ID is required",
+        // Store user and meeting information in socket session
+        socket.data = { token, userId, meetId };
+
+        /**
+         * Sends a request to backend to add or update user in the meeting.
+         */
+        const meetUsers = await request<UserWithSocketId[] | BackendError>({
+          method: "PUT",
+          endpoint: `/api/meetings/updateOrAddMeetingUser/${meetId}`,
+          data: { userId, socketId: socket.id },
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
         });
-        return;
-      }
 
-      socket.data.meetId = meetId;
+        if (!meetUsers || "error" in meetUsers) {
+          console.error("Error getting meeting users:", meetUsers);
+          socket.emit("chatServerError", {
+            origin: "newUser",
+            message:
+              meetUsers && "error" in meetUsers
+                ? meetUsers.error
+                : "Unexpected error",
+          });
+          return;
+        }
 
-      /**
-       * Sends a request to backend to add or update user in the meeting.
-       */
-      const meetUsers = await request<UserWithSocketId[] | BackendError>({
-        method: "PUT",
-        endpoint: `/api/meetings/updateOrAddMeetingUser/${meetId}`,
-        data: { userId, socketId: socket.id },
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
-        },
-      });
+        socket.join(meetId);
+        console.log(`Socket ${socket.id} joined room: ${meetId}`);
 
-      if (!meetUsers || "error" in meetUsers) {
-        console.error("Error getting meeting users:", meetUsers);
-        socket.emit("socketServerError", {
-          origin: "newUser",
-          message:
-            meetUsers && "error" in meetUsers
-              ? meetUsers.error
-              : "Unexpected error",
+        const joiningUser = meetUsers.find((u) => u.userId === userId) || null;
+        const leavingUser = null;
+
+        console.log(`User ${userId} joined. Total users: ${meetUsers.length}`);
+
+        /**
+         * Emitted when the user list in the meeting changes.
+         *
+         * @event usersOnline
+         * @param {UserWithSocketId[]} meetUsers - Updated list of meeting users.
+         * @param {UserWithSocketId|null} joiningUser - User who just joined.
+         * @param {UserWithSocketId|null} leavingUser - User who left (null here).
+         */
+        io.to(meetId).emit("usersOnline", meetUsers, joiningUser, leavingUser);
+      } catch (error) {
+        console.error("Error in newUser:", error);
+        socket.emit("chatServerError", {
+          origin: "backend",
+          message: error instanceof Error ? error.message : "Unexpected error",
         });
-        return;
       }
-
-      socket.join(meetId);
-
-      const joiningUser = meetUsers.find((u) => u.userId === userId) || null;
-      const leavingUser = null;
-
-      console.log(`User ${userId} joined. Total users: ${meetUsers.length}`);
-
-      /**
-       * Emitted when the user list in the meeting changes.
-       */
-      io.to(meetId).emit("usersOnline", meetUsers, joiningUser, leavingUser);
-    } catch (error) {
-      console.error("Error in newUser:", error);
-      socket.emit("socketServerError", {
-        origin: "backend",
-        message: error instanceof Error ? error.message : "Unexpected error",
-      });
-    }
-  });
+    },
+  );
 
   /**
    * Sends a chat message to all users in a meeting.
@@ -156,24 +154,25 @@ io.on("connection", (socket: Socket) => {
    * @param {ChatMessagePayload} payload - Message payload.
    */
   socket.on("sendMessage", (payload: ChatMessagePayload) => {
-    const meetId = socket.data.meetId;
-    const userId = socket.data.userId;
+    const meetId = socket.data?.meetId;
 
     console.log(`Attempting to send message in meeting: ${meetId}`);
+    console.log(`From user: ${payload.userId}`);
+    console.log(`Message content: "${payload.message}"`);
 
     try {
-      const trimmed = payload?.message?.trim();
-      if (!trimmed) {
-        console.log("Empty message");
+      if (!meetId) {
+        console.error("Socket not associated with any meeting");
+        socket.emit("chatServerError", {
+          origin: "sendMessage",
+          message: "Not in a meeting room",
+        });
         return;
       }
 
-      if (payload.userId !== userId) {
-        console.error("❌ User ID mismatch");
-        socket.emit("socketServerError", {
-          origin: "sendMessage",
-          message: "Unauthorized: User ID mismatch",
-        });
+      const trimmed = payload?.message?.trim();
+      if (!trimmed) {
+        console.log("Empty message, ignoring");
         return;
       }
 
@@ -183,16 +182,21 @@ io.on("connection", (socket: Socket) => {
         timestamp: payload.timestamp ?? new Date().toISOString(),
       };
 
-      console.log(`Message sent from user ${payload.userId}`);
+      console.log(`Broadcasting message to room ${meetId}:`, outgoing);
 
       /**
        * Emitted when a new chat message is broadcasted.
+       *
+       * @event newMessage
+       * @param {ChatMessagePayload} outgoing - Sanitized outgoing message.
        */
       io.to(meetId).emit("newMessage", outgoing);
+
+      console.log(`Message successfully broadcasted to ${meetId}`);
     } catch (error) {
       console.error("Error in sendMessage:", error);
-      socket.emit("socketServerError", {
-        origin: "backend",
+      socket.emit("chatServerError", {
+        origin: "sendMessage",
         message: error instanceof Error ? error.message : "Unexpected error",
       });
     }
@@ -204,7 +208,7 @@ io.on("connection", (socket: Socket) => {
    * @event disconnect
    */
   socket.on("disconnect", async () => {
-    const { token, userId, meetId } = socket.data;
+    const { token, userId, meetId } = socket.data || {};
 
     console.log(`Socket ${socket.id} disconnected`);
 
@@ -246,21 +250,8 @@ io.on("connection", (socket: Socket) => {
       console.error("Error in disconnect handler:", error);
     }
   });
-
-  /**
-   * Handle authentication errors
-   */
-  socket.on("error", (error) => {
-    console.error("Socket error:", error);
-    if (error.message.includes("token") || error.message.includes("auth")) {
-      socket.emit("socketServerError", {
-        origin: "authentication",
-        message: error.message,
-      });
-      socket.disconnect();
-    }
-  });
 });
 
 io.listen(port);
 console.log(`Chat server running on port ${port}`);
+console.log(`Allowed origins:`, origins);
