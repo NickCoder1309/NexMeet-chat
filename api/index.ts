@@ -45,16 +45,20 @@ type ChatMessagePayload = {
  * @property {string|null} [createdAt] - Timestamp of user creation.
  * @property {string|null} [updatedAt] - Timestamp of last update.
  */
-type UserWithSocketId = {
-  userId: string;
-  socketId: string;
+
+export interface User {
+  userId?: string | null;
   name?: string | null;
   email?: string | null;
   age?: number | null;
   photoURL?: string | null;
   createdAt?: string | null;
   updatedAt?: string | null;
-};
+}
+
+export interface UserWithSocketId extends User {
+  socketId: string;
+}
 
 /**
  * @typedef {Object} BackendError
@@ -153,7 +157,7 @@ io.on("connection", (socket: Socket) => {
    * @event sendMessage
    * @param {ChatMessagePayload} payload - Message payload.
    */
-  socket.on("sendMessage", (payload: ChatMessagePayload) => {
+  socket.on("sendMessage", async (payload: ChatMessagePayload) => {
     const meetId = socket.data?.meetId;
 
     console.log(`Attempting to send message in meeting: ${meetId}`);
@@ -181,6 +185,49 @@ io.on("connection", (socket: Socket) => {
         message: trimmed,
         timestamp: payload.timestamp ?? new Date().toISOString(),
       };
+
+      const meetUser = await request<User | BackendError>({
+        method: "GET",
+        endpoint: `/api/users/${payload.userId}`,
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${socket.data.token}`,
+        },
+      });
+
+      if (!meetUser || "error" in meetUser) {
+        console.error("Error getting meeting users:", meetUser);
+        socket.emit("chatServerError", {
+          origin: "getUserById",
+          message: meetUser && "error" in meetUser,
+        });
+        return;
+      }
+
+      const messageToSave = {
+        name: meetUser.name,
+        message: trimmed,
+        timestamp: payload.timestamp ?? new Date().toISOString(),
+      };
+
+      const messageSaved = await request<boolean | BackendError>({
+        method: "PUT",
+        endpoint: `/api/chats/saveMessage/`,
+        data: { meetId, messageToSave },
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${socket.data.token}`,
+        },
+      });
+
+      if (!messageSaved) {
+        console.error("Error saving message");
+        socket.emit("chatServerError", {
+          origin: "saveMessage",
+          message: "Error saving messages",
+        });
+        return;
+      }
 
       console.log(`Broadcasting message to room ${meetId}:`, outgoing);
 
