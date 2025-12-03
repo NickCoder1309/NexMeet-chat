@@ -182,21 +182,47 @@ io.on("connection", (socket: Socket) => {
         timestamp: payload.timestamp ?? new Date().toISOString(),
       };
 
-      console.log(`Broadcasting message to room ${meetId}:`, outgoing);
+      console.log(`Broadcasting message to room ${meetId}`);
 
-      /**
-       * Emitted when a new chat message is broadcasted.
-       *
-       * @event newMessage
-       * @param {ChatMessagePayload} outgoing - Sanitized outgoing message.
-       */
       io.to(meetId).emit("newMessage", outgoing);
 
       console.log(`Message successfully broadcasted to ${meetId}`);
     } catch (error) {
-      console.error("Error in sendMessage:", error);
+      console.error("❌ Error in sendMessage:", error);
       socket.emit("chatServerError", {
         origin: "sendMessage",
+        message: error instanceof Error ? error.message : "Unexpected error",
+      });
+    }
+  });
+
+  /**
+   * ✅ Finalizes the meeting for all participants.
+   *
+   * @event endMeeting
+   * @param {string} meetingId - ID of the meeting to end.
+   */
+  socket.on("endMeeting", async (meetingId: string) => {
+    console.log(`🔚 Host ending meeting: ${meetingId}`);
+
+    try {
+      if (!meetingId) {
+        console.error("❌ No meeting ID provided");
+        return;
+      }
+
+      // ✅ Notificar a TODOS los usuarios en la sala que la reunión terminó
+      io.to(meetingId).emit("meetingEnded", {
+        message: "La reunión ha sido finalizada por el anfitrión",
+      });
+
+      console.log(
+        `✅ Meeting ${meetingId} ended notification sent to all users`,
+      );
+    } catch (error) {
+      console.error("❌ Error ending meeting:", error);
+      socket.emit("chatServerError", {
+        origin: "endMeeting",
         message: error instanceof Error ? error.message : "Unexpected error",
       });
     }
